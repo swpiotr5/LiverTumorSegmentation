@@ -16,7 +16,7 @@ class UNet(nn.Module):
         self.up_convolution_1 = UpSample(1024, 512)
         self.up_convolution_2 = UpSample(512, 256)
         self.up_convolution_3 = UpSample(256, 128)
-        self.up_convolution_4 = UpSample()
+        self.up_convolution_4 = UpSample(128, 64)
 
         self.out = nn.Conv2d(in_channels=64, out_channels=num_classes, kernel_size=1)
 
