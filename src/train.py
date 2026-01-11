@@ -97,6 +97,12 @@ for epoch in range(num_epochs):
     test_losses.append(test_loss)
     print(f"Test loss: {test_loss:.4f}")
 
+    # --- Zapisz najlepszy model ---
+    if test_loss < best_test_loss:
+        best_test_loss = test_loss
+        torch.save(model.state_dict(), "best_model.pth")
+        print(f"Zapisano nowy najlepszy model (test loss: {test_loss:.4f}) do best_model.pth")
+
 
 # --- Zapisz wyniki do pliku CSV ---
 with open("loss_log.csv", "w", newline="") as csvfile:
