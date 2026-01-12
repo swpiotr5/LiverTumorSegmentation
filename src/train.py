@@ -48,6 +48,60 @@ def weighted_dice_loss(pred, target, class_weights=None, smooth=1e-6):
     # Normalizuj przez sumę wag
     return total_loss / class_weights.sum()
 
+# --- Focal Loss implementation ---
+def focal_loss(pred, target, alpha=None, gamma=2.0, smooth=1e-6):
+    """
+    Focal Loss dla ekstremalnego class imbalance
+    Automatycznie zwiększa wagę trudnych przypadków (małe guzy)
+    
+    pred: logits (B, C, H, W) - przed softmax
+    target: maski (B, H, W) - wartości 0...C-1
+    alpha: tensor [C] - wagi klas (None = równe)
+    gamma: focus parameter (2.0 = standard, wyższe = więcej focus na hard examples)
+    """
+    pred = F.softmax(pred, dim=1)  # [B, C, H, W]
+    
+    # Target do one-hot
+    if target.ndim == 4:
+        target = target.squeeze(1)
+    target = F.one_hot(target.long(), num_classes=pred.shape[1])
+    target = target.permute(0, 3, 1, 2).float()
+    
+    if alpha is None:
+        alpha = torch.ones(pred.shape[1], device=pred.device)
+    
+    # Focal term: (1 - p)^gamma
+    focal_weight = (1 - pred) ** gamma
+    
+    # Cross-entropy per klasa
+    ce_loss = -target * torch.log(pred + 1e-8)
+    
+    # Zastosuj focal weight
+    focal_ce = focal_weight * ce_loss
+    
+    # Ważona suma per klasa
+    loss = 0
+    for c in range(pred.shape[1]):
+        loss += alpha[c] * focal_ce[:, c].mean()
+    
+    return loss / alpha.sum()
+
+# --- Combined Loss: Dice + Focal (HYBRID) ---
+def combined_loss(pred, target, class_weights, alpha_dice=0.4, alpha_focal=0.6, gamma=2.5):
+    """
+    Hybrid Loss: Weighted Dice + Focal Loss
+    
+    Dice - dobry dla global overlap
+    Focal - skupia się na hard examples (małe guzy, brzegi)
+    
+    alpha_dice: waga Dice (0.4 = 40%)
+    alpha_focal: waga Focal (0.6 = 60% - więcej focus na trudne przypadki)
+    gamma: focal parameter (2.5 = agresywniejszy niż standard 2.0)
+    """
+    dice = weighted_dice_loss(pred, target, class_weights=class_weights)
+    focal = focal_loss(pred, target, alpha=class_weights, gamma=gamma)
+    return alpha_dice * dice + alpha_focal * focal
+
 # --- Podział na train/test ---
 train_dataset = Dataset(transformation=get_train_transform(), limit_patients=50)  # ✅ PEŁNY DATASET
 dataset_size = len(train_dataset)
@@ -72,7 +126,35 @@ with open('train_test_split.json', 'w') as f:
     json.dump(split_info, f, indent=2)
 print(f"✓ Zapisano split: {len(train_indices)} train, {len(test_indices)} test indeksów do train_test_split.json")
 
-train_loader = DataLoader(train_set, batch_size=4, shuffle=True, num_workers=4, pin_memory=True)
+# --- Stratified Batch Sampling (SBS) ---
+print("\n🎯 Stratified Batch Sampling: zwiększam reprezentację slice'ów z guzami...")
+from torch.utils.data import WeightedRandomSampler
+
+def has_tumor(idx, dataset):
+    """Sprawdź czy slice zawiera guz"""
+    try:
+        _, mask = dataset[idx]
+        return (mask == 2).any().item()
+    except:
+        return False
+
+# Sample weights: 5x większa szansa dla slice'ów z guzem
+sample_weights = []
+tumor_count = 0
+for i in range(len(train_set)):
+    idx = train_set.indices[i]
+    has_t = has_tumor(idx, train_dataset)
+    weight = 5.0 if has_t else 1.0
+    sample_weights.append(weight)
+    if has_t:
+        tumor_count += 1
+
+print(f"   Slice'y z guzem: {tumor_count}/{len(train_set)} ({tumor_count/len(train_set)*100:.1f}%)")
+print(f"   → Te slice'y będą próbkowane 5x częściej!\n")
+
+sampler = WeightedRandomSampler(sample_weights, num_samples=len(train_set), replacement=True)
+train_loader = DataLoader(train_set, batch_size=4, sampler=sampler,  # shuffle=True usunięte (sampler steruje)
+                         num_workers=4, pin_memory=True)
 test_loader = DataLoader(test_set, batch_size=4, shuffle=False, num_workers=4, pin_memory=True)
 
 best_test_loss = float('inf')
@@ -85,14 +167,16 @@ print(f"Używane urządzenie: {device}")
 model = UNet(in_channels=1, num_classes=3)
 model = model.to(device)
 
-# ⚠️ KLUCZOWE: Wagi klas dla weighted loss
+# ⚖️ BEZPIECZNE WAGI KLAS dla tumor
 # Background: 1.0 (baseline)
-# Liver: 13.4x (93% / 7% ≈ 13x więcej background niż liver)
-# Tumor: 930x (93% / 0.1% ≈ 930x więcej background niż tumor)
-# Zmniejszam proporcje żeby nie zdominować: [1.0, 5.0, 50.0]
-class_weights = torch.tensor([1.0, 5.0, 50.0], device=device)
-print(f"\n⚖️ Class weights: Background={class_weights[0]:.1f}, Liver={class_weights[1]:.1f}, Tumor={class_weights[2]:.1f}")
-print(f"   → Model będzie 50x bardziej penalizowany za błędy w guzach!\n")
+# Liver: 10.0 (umiarkowane boost)
+# Tumor: 100.0 (silne ale bezpieczne - proven in literature dla medical segmentation)
+
+class_weights = torch.tensor([1.0, 10.0, 100.0], device=device)
+print(f"\n⚖️ Class weights (SAFE MODE dla prezentacji): Background={class_weights[0]:.1f}, Liver={class_weights[1]:.1f}, Tumor={class_weights[2]:.1f}")
+print(f"   → Tumor weight=100 (2x więcej niż poprzednio, ale stabilne)")
+print(f"   → Hybrid Loss: 40% Dice + 60% Focal (gamma=2.5)")
+print(f"   → Stratified Batch Sampling: 5x więcej slice'ów z guzem")
 
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 num_epochs = 100
@@ -108,7 +192,9 @@ for epoch in range(num_epochs):
 
         optimizer.zero_grad()
         outputs = model(images)
-        loss = weighted_dice_loss(outputs, masks, class_weights=class_weights)
+        # 🔥 HYBRID LOSS: Dice (40%) + Focal (60%) z gamma=2.5
+        loss = combined_loss(outputs, masks, class_weights=class_weights, 
+                           alpha_dice=0.4, alpha_focal=0.6, gamma=2.5)
         loss.backward()
         optimizer.step()
 
@@ -128,7 +214,9 @@ for epoch in range(num_epochs):
                 images = images.permute(0, 3, 1, 2)
             masks = masks.long().to(device)  # ✅ ZMIANA: long() dla weighted_dice_loss
             outputs = model(images)
-            loss = weighted_dice_loss(outputs, masks, class_weights=class_weights)
+            # 🔥 HYBRID LOSS również w ewaluacji
+            loss = combined_loss(outputs, masks, class_weights=class_weights,
+                               alpha_dice=0.4, alpha_focal=0.6, gamma=2.5)
             test_loss += loss.item() * images.size(0)
     test_loss = test_loss / len(test_set)
     test_losses.append(test_loss)
