@@ -3,15 +3,18 @@ import glob
 import numpy as np
 
 class Dataset():
-    def __init__(self, base_dir="../data/prepared", transformation=None, data_type = ['liver', 'liver_tumor', 'tumor'], limit_patients=None):
+    def __init__(self, base_dir="../data/prepared", transformation=None, data_type = ['liver', 'liver_tumor', 'tumor'], limit_patients=None, person_list=None):
         self.images = []
         self.masks = []
         self.transformation = transformation
         self.data_type = data_type
 
-        person_dirs = [d for d in sorted(os.listdir(base_dir)) if "person" in d]
-        if limit_patients is not None:
-            person_dirs = person_dirs[:limit_patients]
+        if person_list is not None:
+            person_dirs = sorted(person_list)
+        else:
+            person_dirs = [d for d in sorted(os.listdir(base_dir)) if "person" in d]
+            if limit_patients is not None:
+                person_dirs = person_dirs[:limit_patients]
 
         for person_dir in person_dirs:
             for data_type in self.data_type:

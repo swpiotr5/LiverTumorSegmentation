@@ -9,11 +9,12 @@ Użycie:
 
 import csv
 import json
+import random
 import torch
 import torch.nn.functional as F
 from Dataset import Dataset
 from img_transformations import get_train_transform
-from torch.utils.data import DataLoader, random_split, WeightedRandomSampler
+from torch.utils.data import DataLoader, WeightedRandomSampler
 import numpy as np
 import matplotlib.pyplot as plt
 from unet import UNet
@@ -90,38 +91,47 @@ def main():
     train_losses = []
     test_losses = []
 
-    # --- Dataset ---
+    # --- Dataset — split per pacjent ---
     print("Ładowanie datasetu...")
-    dataset = Dataset(base_dir="../data/prepared_fine_tuning",
-                      transformation=get_train_transform(), limit_patients=LIMIT_PATIENTS)
-    dataset_size = len(dataset)
-    train_size = int(0.8 * dataset_size)
-    test_size = dataset_size - train_size
-    train_set, test_set = random_split(dataset, [train_size, test_size])
+    base_dir = "../data/prepared_fine_tuning"
+    all_persons = sorted([d for d in os.listdir(base_dir) if "person" in d])
+    if LIMIT_PATIENTS is not None:
+        all_persons = all_persons[:LIMIT_PATIENTS]
+
+    random.seed(42)
+    random.shuffle(all_persons)
+    split = int(0.8 * len(all_persons))
+    train_persons = all_persons[:split]
+    test_persons  = all_persons[split:]
+
+    train_set = Dataset(base_dir=base_dir, transformation=get_train_transform(),
+                        person_list=train_persons)
+    test_set  = Dataset(base_dir=base_dir, transformation=None,
+                        person_list=test_persons)
 
     # Zapisz split
     split_info = {
-        'train_indices': train_set.indices,
-        'test_indices': test_set.indices,
-        'train_size': len(train_set.indices),
-        'test_size': len(test_set.indices),
-        'total_size': dataset_size,
+        'train_persons': train_persons,
+        'test_persons': test_persons,
+        'train_size': len(train_set),
+        'test_size': len(test_set),
+        'total_persons': len(all_persons),
         'limit_patients': LIMIT_PATIENTS,
-        'mode': 'finetune'
+        'mode': 'finetune_per_patient'
     }
     with open('finetune_split.json', 'w') as f:
         json.dump(split_info, f, indent=2)
-    print(f"Split: {train_size} train, {test_size} test (total: {dataset_size})")
+    print(f"Pacjenci: {len(train_persons)} train, {len(test_persons)} test")
+    print(f"Slice'y:  {len(train_set)} train, {len(test_set)} test")
 
     # --- Stratified Batch Sampling ---
     print("\nStratified Batch Sampling: skanowanie slice'ów z guzami...")
     sample_weights = []
     tumor_count = 0
     for i in range(len(train_set)):
-        idx = train_set.indices[i]
         try:
-            _, mask = dataset[idx]
-            has_tumor = (mask == 2).any().item()
+            mask = np.load(train_set.masks[i])
+            has_tumor = bool((mask == 2).any())
         except Exception:
             has_tumor = False
         weight = TUMOR_OVERSAMPLE_WEIGHT if has_tumor else 1.0
