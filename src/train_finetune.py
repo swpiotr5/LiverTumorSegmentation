@@ -13,7 +13,7 @@ import random
 import torch
 import torch.nn.functional as F
 from Dataset import Dataset
-from img_transformations import get_train_transform
+from img_transformations import get_train_transform, get_eval_transform
 from torch.utils.data import DataLoader, WeightedRandomSampler
 import numpy as np
 import matplotlib.pyplot as plt
@@ -70,21 +70,27 @@ def combined_loss(pred, target, class_weights, alpha_dice=0.4, alpha_focal=0.6, 
 
 
 # === KONFIGURACJA FINE-TUNINGU ===
-PRETRAINED_PATH = None                    # None = trening od zera
-LEARNING_RATE = 1e-3                      # Pełny LR dla treningu od zera
-NUM_EPOCHS = 100                          # Pełny trening na pełnym datasecie
-BATCH_SIZE = 8
+PRETRAINED_PATH = "best_model_v2_e47.pth" # Wznowienie V2 z checkpointa (po przerwaniu na epoce 47)
+LEARNING_RATE = 3e-4                      # Niższy LR bo już dobrze wytrenowany
+NUM_EPOCHS = 53                           # Tyle zostało z oryginalnych 100 (47 już zrobione)
+BATCH_SIZE = 16                           # Zwiększone (mamy 24 GB VRAM na L4)
 LIMIT_PATIENTS = None                     # None = PEŁNY DATASET
-TUMOR_OVERSAMPLE_WEIGHT = 5.0
+TUMOR_OVERSAMPLE_WEIGHT = 3.0             # Zmniejszone — oversampler już robi robotę razem z class_weights
 NUM_WORKERS = 4
 
-# Class weights (te same co w train.py)
-CLASS_WEIGHTS_VALUES = [1.0, 10.0, 100.0]
+# Class weights — mniej agresywne, żeby nie destabilizować gradientu.
+# Stare [1, 10, 100] powodowały kolaps do trybu "same zera" na starcie.
+CLASS_WEIGHTS_VALUES = [1.0, 3.0, 8.0]
 
 # Hybrid loss params
 ALPHA_DICE = 0.4
 ALPHA_FOCAL = 0.6
 GAMMA = 2.5
+
+# LR schedule
+WARMUP_EPOCHS = 0                         # Warm-start z checkpointa — warmup niepotrzebny
+SCHEDULER_PATIENCE = 10                   # Było 5 — dajemy modelowi więcej czasu zanim utniemy LR
+SCHEDULER_FACTOR = 0.7                    # Było 0.5 — łagodniejsze cięcie LR
 
 
 def main():
@@ -106,7 +112,7 @@ def main():
 
     train_set = Dataset(base_dir=base_dir, transformation=get_train_transform(),
                         person_list=train_persons)
-    test_set  = Dataset(base_dir=base_dir, transformation=None,
+    test_set  = Dataset(base_dir=base_dir, transformation=get_eval_transform(),
                         person_list=test_persons)
 
     # Zapisz split
@@ -173,13 +179,20 @@ def main():
 
     # LR Scheduler - zmniejsza LR gdy test loss stoi w miejscu
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=5, verbose=True
+        optimizer, mode='min', factor=SCHEDULER_FACTOR, patience=SCHEDULER_PATIENCE
     )
 
     best_test_loss = float('inf')
 
     # --- Training loop ---
     for epoch in range(NUM_EPOCHS):
+        # Warmup: liniowo rosnący LR przez pierwsze WARMUP_EPOCHS epok.
+        # Stabilizuje trening z dużymi class weights zanim Adam zaadaptuje momenty.
+        if epoch < WARMUP_EPOCHS:
+            warmup_lr = LEARNING_RATE * (epoch + 1) / WARMUP_EPOCHS
+            for g in optimizer.param_groups:
+                g['lr'] = warmup_lr
+
         model.train()
         running_loss = 0.0
         for images, masks in train_loader:
@@ -217,10 +230,12 @@ def main():
         test_losses.append(test_loss)
 
         current_lr = optimizer.param_groups[0]['lr']
-        print(f"Epoch {epoch+1}/{NUM_EPOCHS} | train: {epoch_loss:.4f} | test: {test_loss:.4f} | lr: {current_lr:.2e}")
+        phase = "warmup" if epoch < WARMUP_EPOCHS else "plateau"
+        print(f"Epoch {epoch+1}/{NUM_EPOCHS} [{phase}] | train: {epoch_loss:.4f} | test: {test_loss:.4f} | lr: {current_lr:.2e}")
 
-        # LR scheduler step
-        scheduler.step(test_loss)
+        # Scheduler dopiero po warmupie, żeby ReduceLROnPlateau nie liczył plateau podczas rampu LR
+        if epoch >= WARMUP_EPOCHS:
+            scheduler.step(test_loss)
 
         # Zapisz najlepszy model
         if test_loss < best_test_loss:
@@ -228,12 +243,12 @@ def main():
             torch.save(model.state_dict(), "best_model_finetuned.pth")
             print(f"  -> Nowy best model! (test loss: {test_loss:.4f})")
 
-    # --- Zapisz logi ---
-    with open("finetune_loss_log.csv", "w", newline="") as csvfile:
-        writer = csv.writer(csvfile)
-        writer.writerow(["epoch", "train_loss", "test_loss"])
-        for i, (tr, te) in enumerate(zip(train_losses, test_losses)):
-            writer.writerow([i + 1, tr, te])
+        # Inkrementalny zapis logów CSV — nie tracisz danych jak przerwiesz trening
+        with open("finetune_loss_log.csv", "w", newline="") as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(["epoch", "train_loss", "test_loss"])
+            for i, (tr, te) in enumerate(zip(train_losses, test_losses)):
+                writer.writerow([i + 1, tr, te])
 
     # --- Plot ---
     plt.figure(figsize=(8, 5))
